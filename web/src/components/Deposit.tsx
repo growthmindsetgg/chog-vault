@@ -179,15 +179,28 @@ export function Deposit() {
         args: [address],
       })) as bigint;
 
-      if (!basis && sharesAfter > 0n && snap) {
-        const basisNAV = (monIn * snap.priceE8) / 10n ** 20n + usdcIn;
-        setBasis({
-          monIn:  monIn.toString(),
-          usdcIn: usdcIn.toString(),
-          basisNAV: basisNAV.toString(),
-          basisPriceE8: snap.priceE8.toString(),
-          basisBlock: Number(receipt.blockNumber),
-        });
+      // STEP 3 — basis accumulates across deposits.
+      //   new entry  : sum amounts + $ value of THIS deposit (priced now)
+      //   first time : write a fresh entry at the current block
+      if (sharesAfter > 0n && snap) {
+        const thisDepositUsd = (monIn * snap.priceE8) / 10n ** 20n + usdcIn;
+        if (basis) {
+          setBasis({
+            monAmount:      (BigInt(basis.monAmount)  + monIn).toString(),
+            usdcAmount:     (BigInt(basis.usdcAmount) + usdcIn).toString(),
+            depositUsd:     (BigInt(basis.depositUsd) + thisDepositUsd).toString(),
+            priceAtDeposit: snap.priceE8.toString(),       // last
+            depositBlock:   basis.depositBlock,            // keep the FIRST
+          });
+        } else {
+          setBasis({
+            monAmount:      monIn.toString(),
+            usdcAmount:     usdcIn.toString(),
+            depositUsd:     thisDepositUsd.toString(),
+            priceAtDeposit: snap.priceE8.toString(),
+            depositBlock:   Number(receipt.blockNumber),
+          });
+        }
       }
 
       setMonStr(""); setUsdcStr("");
