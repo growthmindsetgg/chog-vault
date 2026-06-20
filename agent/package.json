@@ -1,0 +1,24 @@
+{
+  "name": "chog-vault-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Non-LLM autonomous rebalancing agent for Chog Vault. Runs locally; signs only rebalance().",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "tick": "tsx run.ts",
+    "pyth-probe": "tsx scripts/pyth-probe.ts",
+    "pyth-pusher": "tsx scripts/pyth-pusher.ts",
+    "nudge-price": "tsx scripts/nudge-price.ts",
+    "price-driver": "tsx scripts/price-driver.ts"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "viem": "^2.52.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.6.0"
+  }
+}
