@@ -34,6 +34,13 @@ export interface TickResult {
   rebalanceTx?: Hash;
   bpsAfter?: bigint;
   setPriceTx?: Hash;
+
+  // STEP 6 — surfaced so run.ts can detect deposit-driven rebalances and
+  // narrate "Split deposit" with the actual MON sold.
+  totalShares?: bigint;
+  monBefore?: bigint;
+  monAfter?: bigint;
+  paused?: boolean;
 }
 
 // Public clients are cheap; build them on demand for scripts.
@@ -64,8 +71,9 @@ export async function coreTick(priceSource: PriceSource, deps: TickDeps): Promis
       await publicClient.waitForTransactionReceipt({ hash: setPriceTx });
     }
 
-    // 2) Read vault state.
-    const [monBal, usdcBal, paused] = await Promise.all([
+    // 2) Read vault state — include totalShares so callers can detect deposits
+    //    between ticks.
+    const [monBal, usdcBal, paused, totalShares] = await Promise.all([
       publicClient.readContract({
         address: ADDRESSES.RebalanceVault, abi: vaultAbi, functionName: "monBalance",
       }) as Promise<bigint>,
@@ -75,6 +83,9 @@ export async function coreTick(priceSource: PriceSource, deps: TickDeps): Promis
       publicClient.readContract({
         address: ADDRESSES.RebalanceVault, abi: vaultAbi, functionName: "paused",
       }) as Promise<boolean>,
+      publicClient.readContract({
+        address: ADDRESSES.RebalanceVault, abi: vaultAbi, functionName: "totalShares",
+      }) as Promise<bigint>,
     ]);
 
     const monValue = (monBal * priceE8) / 10n ** 20n; // 6 dec
@@ -85,6 +96,7 @@ export async function coreTick(priceSource: PriceSource, deps: TickDeps): Promis
     // 3) Maybe rebalance.
     let rebalanceTx: Hash | undefined;
     let bpsAfter: bigint | undefined;
+    let monAfter: bigint | undefined;
 
     if (decision.action !== "hold" && !paused && agentWallet) {
       rebalanceTx = await agentWallet.writeContract({
@@ -96,7 +108,7 @@ export async function coreTick(priceSource: PriceSource, deps: TickDeps): Promis
       });
       await publicClient.waitForTransactionReceipt({ hash: rebalanceTx });
 
-      // Re-read for after-bps.
+      // Re-read for after-bps and monAfter.
       const [m2, u2] = await Promise.all([
         publicClient.readContract({
           address: ADDRESSES.RebalanceVault, abi: vaultAbi, functionName: "monBalance",
@@ -105,12 +117,16 @@ export async function coreTick(priceSource: PriceSource, deps: TickDeps): Promis
           address: ADDRESSES.RebalanceVault, abi: vaultAbi, functionName: "usdcBalance",
         }) as Promise<bigint>,
       ]);
+      monAfter = m2;
       const mv2 = (m2 * priceE8) / 10n ** 20n;
       const nav2 = mv2 + u2;
       bpsAfter = nav2 === 0n ? 0n : (mv2 * 10_000n) / nav2;
     }
 
-    return { ok: true, priceE8, bpsBefore, decision, rebalanceTx, bpsAfter, setPriceTx };
+    return {
+      ok: true, priceE8, bpsBefore, decision, rebalanceTx, bpsAfter, setPriceTx,
+      totalShares, monBefore: monBal, monAfter, paused,
+    };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     return { ok: false, error: msg };

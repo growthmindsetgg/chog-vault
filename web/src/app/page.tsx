@@ -6,6 +6,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Deposit } from "@/components/Deposit";
 import { Dashboard } from "@/components/Dashboard";
 import { Agent } from "@/components/Agent";
+import { PriceBadge } from "@/components/PriceBadge";
 
 export default function Home() {
   const notDeployed = addresses.RebalanceVault.toLowerCase() === "0x0000000000000000000000000000000000000000";
@@ -18,6 +19,7 @@ export default function Home() {
             <div className="size-7 rounded-lg bg-[var(--purple)]" aria-hidden />
             <span className="font-extrabold tracking-tight text-lg">Chog Vault</span>
             <span className="text-xs text-[var(--text-muted)] hidden sm:inline">· Monad testnet</span>
+            <PriceBadge />
           </div>
           <ConnectButton showBalance={false} chainStatus="icon" />
         </div>

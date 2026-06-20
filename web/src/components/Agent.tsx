@@ -9,17 +9,58 @@ import { vaultAbi } from "@/abi";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { useVaultSnapshot } from "@/hooks/useVaultSnapshot";
-import { useLoggedFeed, type RebalanceEvent, type LogEntry } from "@/hooks/useLoggedEvents";
+import { useLoggedFeed, type LogEntry } from "@/hooks/useLoggedEvents";
 import { useSendTransactionSync } from "@/hooks/useSendTransactionSync";
 import { EXPLORER_BASE } from "@/wagmi";
 import { formatBps, formatPriceE8, formatUSDC, shortAddress } from "@/lib/utils";
 
-function narrate(ev: RebalanceEvent): string {
-  // monValueBps is the AFTER value emitted by the contract.
-  const after = ev.monValueBps;
-  if (after < 5900n) return `Price moved to ${formatPriceE8(ev.priceE8)} — agent bought MON with USDC, → ${formatBps(after)}`;
-  if (after > 6100n) return `Price moved to ${formatPriceE8(ev.priceE8)} — agent trimmed MON → USDC, → ${formatBps(after)}`;
-  return `Price moved to ${formatPriceE8(ev.priceE8)} — agent held inside band, → ${formatBps(after)}`;
+interface ActionLine {
+  title: string;
+  subtitle: string;
+  accent: "purple" | "rose" | "green" | "muted";
+}
+
+function narrate(e: LogEntry): ActionLine {
+  const before = formatBps(e.bpsBefore);
+  const after  = formatBps(e.bpsAfter);
+  const price  = formatPriceE8(e.priceE8);
+  switch (e.kind) {
+    case "split":
+      return {
+        title: "Split deposit — sold MON → USDC to 60/40",
+        subtitle: `at ${price} · ${before} → ${after}`,
+        accent: "purple",
+      };
+    case "trim":
+      return {
+        title: `Trim — sold MON → USDC (${before} → ${after})`,
+        subtitle: `at ${price}`,
+        accent: "rose",
+      };
+    case "add":
+      return {
+        title: `Add — bought MON ← USDC (${before} → ${after})`,
+        subtitle: `at ${price}`,
+        accent: "green",
+      };
+    case "hold":
+    default:
+      return {
+        title: "Holding — inside the 60/40 band",
+        subtitle: `at ${price} · ${before}`,
+        accent: "muted",
+      };
+  }
+}
+
+function accentClass(a: ActionLine["accent"]): string {
+  switch (a) {
+    case "purple": return "text-[var(--purple-strong)]";
+    case "rose":   return "text-[var(--rose)]";
+    case "green":  return "text-[var(--green)]";
+    case "muted":
+    default:       return "text-[var(--text-muted)]";
+  }
 }
 
 export function Agent() {
@@ -81,26 +122,42 @@ export function Agent() {
         <Card>
           <CardHeader>
             <CardTitle>Live activity</CardTitle>
-            <CardDescription>Newest first. Every line is a Rebalanced event from the chain.</CardDescription>
+            <CardDescription>
+              Newest first. Each line is a Rebalanced event classified by what the agent did.
+            </CardDescription>
           </CardHeader>
           <CardContent>
-            {(!feed || feed.rebalances.length === 0) ? (
+            {(!feed || feed.entries.length === 0) ? (
               <div className="py-6 text-center text-[var(--text-muted)]">Waiting for the first rebalance…</div>
             ) : (
               <ul className="divide-y divide-[var(--border)]">
-                {feed.rebalances.slice(0, 12).map((ev) => (
-                  <li key={ev.txHash} className="py-3 flex flex-col gap-1">
-                    <p className="text-sm">{narrate(ev)}</p>
-                    <a
-                      href={`${EXPLORER_BASE}/tx/${ev.txHash}`}
-                      target="_blank" rel="noreferrer"
-                      className="text-xs font-mono text-[var(--purple-strong)] hover:underline inline-flex items-center gap-1"
-                    >
-                      block #{ev.blockNumber.toString()} · {shortAddress(ev.txHash, 10, 8)}
-                      <ExternalLink className="size-3" />
-                    </a>
-                  </li>
-                ))}
+                {feed.entries.slice(0, 12).map((e) => {
+                  const line = narrate(e);
+                  return (
+                    <li key={e.seq} className="py-3 flex flex-col gap-1">
+                      <div className="flex items-baseline gap-2">
+                        <span className={`text-sm font-semibold ${accentClass(line.accent)}`}>{line.title}</span>
+                      </div>
+                      <div className="text-xs text-[var(--text-muted)]">{line.subtitle}</div>
+                      <div className="text-xs font-mono text-[var(--text-muted)] flex items-center gap-2">
+                        <span>{new Date(Number(e.ts) * 1000).toLocaleTimeString()}</span>
+                        {e.blockNumber !== undefined && <span>· block #{e.blockNumber.toString()}</span>}
+                        {e.txHash ? (
+                          <a
+                            href={`${EXPLORER_BASE}/tx/${e.txHash}`}
+                            target="_blank" rel="noreferrer"
+                            className="text-[var(--purple-strong)] hover:underline inline-flex items-center gap-1"
+                          >
+                            {shortAddress(e.txHash, 10, 8)}
+                            <ExternalLink className="size-3" />
+                          </a>
+                        ) : (
+                          <span className="opacity-70">tx out of window</span>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </CardContent>
@@ -189,7 +246,7 @@ function ProofPanel({ entries }: { entries: LogEntry[] }) {
                     <td className="py-2 pr-3">{new Date(Number(e.ts) * 1000).toLocaleTimeString()}</td>
                     <td className="py-2 pr-3">
                       <a
-                        href={`${EXPLORER_BASE}/address/${addresses.LogBook}`}
+                        href={`${EXPLORER_BASE}/${e.txHash ? `tx/${e.txHash}` : `address/${addresses.LogBook}`}`}
                         target="_blank" rel="noreferrer"
                         className="text-[var(--purple-strong)] hover:underline inline-flex items-center gap-1"
                       >

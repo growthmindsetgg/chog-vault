@@ -3,11 +3,19 @@
 // useSendTransactionSync — Monad supports `eth_sendRawTransactionSync` which
 // returns the receipt in the SAME call. wagmi v2 doesn't yet expose a first-
 // class hook for it, so this wrapper uses the spec-mandated fallback path:
-// writeContract → waitForTransactionReceipt, surfaced as one stateful op.
+// writeContract → waitForTransactionReceipt.
+//
+// STEP 5 latency fix: viem's default receipt polling is 4_000ms. With Monad's
+// sub-second block time that means a 1-block tx is reported ~4s late. We force
+// 500ms polling here so receipts surface in ~1-2s end-to-end. STEP 1 confirmed
+// Ankr and the official RPC both support `eth_sendRawTransactionSync` (no
+// -32601), so swapping RPCs is unnecessary.
 
 import { useCallback, useState } from "react";
 import { useWriteContract, usePublicClient } from "wagmi";
 import type { Abi, Hash, TransactionReceipt } from "viem";
+
+const RECEIPT_POLL_MS = 500;
 
 export interface SyncOptions<TAbi extends Abi> {
   address: `0x${string}`;
@@ -44,7 +52,11 @@ export function useSendTransactionSync() {
           value: opts.value,
         } as Parameters<typeof writeContractAsync>[0]);
         setState((s) => ({ ...s, txHash: hash }));
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        const receipt = await publicClient.waitForTransactionReceipt({
+          hash,
+          pollingInterval: RECEIPT_POLL_MS,
+          confirmations: 1,
+        });
         setState({ loading: false, txHash: hash, receipt, error: null });
         return receipt;
       } catch (e) {

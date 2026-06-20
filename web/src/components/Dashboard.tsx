@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { useAccount } from "wagmi";
+import { useAccount, usePublicClient } from "wagmi";
 import { toast } from "sonner";
 import addresses from "@addresses";
 import { vaultAbi } from "@/abi";
@@ -12,6 +12,7 @@ import { useLoggedFeed } from "@/hooks/useLoggedEvents";
 import { useBasis } from "@/hooks/useBasis";
 import { useSendTransactionSync } from "@/hooks/useSendTransactionSync";
 import { formatBps, formatMON, formatUSDC } from "@/lib/utils";
+import { classifyTxError } from "@/lib/tx";
 import { NavChart } from "@/components/NavChart";
 
 function pct(num: bigint, denom: bigint): string {
@@ -25,6 +26,7 @@ function pct(num: bigint, denom: bigint): string {
 
 export function Dashboard() {
   const { address } = useAccount();
+  const publicClient = usePublicClient();
   const { data: snap, refetch } = useVaultSnapshot();
   const { data: feed } = useLoggedFeed();
   const { basis } = useBasis(snap?.userShares);
@@ -55,23 +57,39 @@ export function Dashboard() {
   }, [snap, percent]);
 
   const onWithdraw = async () => {
-    if (!address) { toast.error("Connect wallet first"); return; }
+    if (!address || !publicClient) { toast.error("Connect wallet first"); return; }
     if (withdrawShares === 0n) { toast.error("Choose an amount"); return; }
+
+    // Pre-flight simulate: AGENT wallet hits "vault: agent blocked" here too.
     try {
-      await tx.send({
+      await publicClient.simulateContract({
         address: addresses.RebalanceVault as `0x${string}`,
-        abi: vaultAbi,
-        functionName: "withdraw",
+        abi: vaultAbi, functionName: "withdraw",
+        args: [withdrawShares], account: address,
+      });
+    } catch (preErr) {
+      const cls = classifyTxError(preErr);
+      // eslint-disable-next-line no-console
+      console.warn("[withdraw pre-flight]", cls);
+      toast.error(cls.message);
+      return;
+    }
+
+    try {
+      const receipt = await tx.send({
+        address: addresses.RebalanceVault as `0x${string}`,
+        abi: vaultAbi, functionName: "withdraw",
         args: [withdrawShares],
       });
+      if (receipt.status !== "success") {
+        toast.error("Withdraw reverted on-chain.");
+        return;
+      }
       await refetch();
       toast.success(percent === 100 ? "Withdrew all. Basis cleared." : "Withdraw confirmed.");
     } catch (e) {
-      if (e instanceof Error && /User rejected/i.test(e.message)) {
-        toast.message("Withdraw cancelled");
-      } else {
-        toast.error(`Withdraw failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
+      const cls = classifyTxError(e);
+      toast.error(cls.message);
     }
   };
 

@@ -1,45 +1,93 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { useAccount, usePublicClient } from "wagmi";
+import { useAccount, usePublicClient, useReadContract } from "wagmi";
 import { toast } from "sonner";
 import addresses from "@addresses";
 import { usdcAbi, vaultAbi } from "@/abi";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { useVaultSnapshot } from "@/hooks/useVaultSnapshot";
 import { useBasis } from "@/hooks/useBasis";
 import { useSendTransactionSync } from "@/hooks/useSendTransactionSync";
 import { formatMON, formatUSDC, parseMONInput, parseUSDCInput } from "@/lib/utils";
+import { classifyTxError } from "@/lib/tx";
 
 const GAS_PAD_WEI = 10_000_000_000_000_000n; // 0.01 MON
 
-// 0xfb8f41b2 = ERC20InsufficientAllowance(address,uint256,uint256)
-function isInsufficientAllowance(err: unknown): boolean {
-  if (!err) return false;
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes("0xfb8f41b2") || msg.includes("ERC20InsufficientAllowance");
-}
+type Mode = "mon-only" | "advanced";
+
+// Strict 4-state machine for the advanced (MON+USDC) button. Order matters.
+// "wait" means DISABLED — the button MUST NOT fall through to "deposit"
+// while allowance is undefined or loading.
+type AdvancedButton = "deposit" | "wait" | "approve";
 
 export function Deposit() {
-  const { address } = useAccount();
+  const { address, isConnected } = useAccount();
   const publicClient = usePublicClient();
-  const { data: snap, refetch } = useVaultSnapshot();
+  const { data: snap, refetch, isLoading: snapLoading, isFetching: snapFetching } = useVaultSnapshot();
   const { basis, setBasis } = useBasis(snap?.userShares);
 
+  const [mode, setMode] = useState<Mode>("mon-only");
   const [monStr,  setMonStr]  = useState("");
   const [usdcStr, setUsdcStr] = useState("");
 
   const monIn  = useMemo(() => parseMONInput(monStr),   [monStr]);
-  const usdcIn = useMemo(() => parseUSDCInput(usdcStr), [usdcStr]);
+  const usdcIn = useMemo(
+    () => (mode === "mon-only" ? 0n : parseUSDCInput(usdcStr)),
+    [usdcStr, mode],
+  );
 
-  const allowance = snap?.userUsdcAllowance ?? 0n;
-  const needsApproval = usdcIn > 0n && allowance < usdcIn;
+  // STEP 3 — dedicated allowance read, NOT derived from the shared snapshot.
+  // Enabled only when an allowance check actually matters. Refetched manually
+  // after every approve / deposit receipt; the queryKey changes on usdcIn,
+  // so input edits don't force a refetch (we trigger explicitly).
+  const allowanceQuery = useReadContract({
+    address: addresses.MockUSDC as `0x${string}`,
+    abi: usdcAbi,
+    functionName: "allowance",
+    args: address ? [address, addresses.RebalanceVault as `0x${string}`] : undefined,
+    query: {
+      enabled: isConnected && !!address && mode === "advanced" && usdcIn > 0n,
+      // Treat anything older than 1s as stale so input edits get a fresh check.
+      staleTime: 1_000,
+    },
+  });
+
+  const allowance = allowanceQuery.data as bigint | undefined;
+  const allowanceLoading =
+    allowanceQuery.isPending || allowanceQuery.isLoading || allowanceQuery.isFetching;
+
+  // ---- 4-state machine (advanced only) ----
+  const advancedButton: AdvancedButton = useMemo(() => {
+    if (usdcIn === 0n)                  return "deposit"; // no approve needed for MON-only or empty USDC
+    if (allowance === undefined)        return "wait";    // never fall through while undefined
+    if (allowanceLoading)               return "wait";    // never fall through while loading
+    if (allowance < usdcIn)             return "approve";
+    return "deposit";
+  }, [usdcIn, allowance, allowanceLoading]);
+
+  if (typeof window !== "undefined") {
+    // eslint-disable-next-line no-console
+    console.log("[Deposit render]", {
+      mode,
+      rawInput: { mon: monStr, usdc: usdcStr },
+      monParsed: monIn.toString(),
+      usdcParsed: usdcIn.toString(),
+      allowance: allowance === undefined ? "undefined" : allowance.toString(),
+      allowanceLoading,
+      chosenBranch:
+        mode === "mon-only" ? "mon-only-deposit" : advancedButton,
+      snapDefined: !!snap,
+      snapLoading: snapLoading || snapFetching,
+    });
+  }
 
   const tx = useSendTransactionSync();
 
-  const handleMax = () => {
+  const handleMonMax = () => {
     if (!snap) return;
     const max = snap.userMonBalance > GAS_PAD_WEI ? snap.userMonBalance - GAS_PAD_WEI : 0n;
     setMonStr(formatMON(max, 4));
@@ -51,47 +99,83 @@ export function Deposit() {
   };
 
   const approve = async () => {
-    if (!address) { toast.error("Connect wallet first"); return; }
+    if (!address || !publicClient) { toast.error("Connect wallet first"); return; }
     if (usdcIn === 0n) return;
+
+    // Pre-flight simulate. Catches reverts BEFORE the wallet asks the user
+    // to sign — no gas burned for the agent-blocked / paused / bad-state case.
     try {
-      await tx.send({
+      await publicClient.simulateContract({
         address: addresses.MockUSDC as `0x${string}`,
-        abi: usdcAbi,
-        functionName: "approve",
+        abi: usdcAbi, functionName: "approve",
+        args: [addresses.RebalanceVault as `0x${string}`, usdcIn],
+        account: address,
+      });
+    } catch (preErr) {
+      const cls = classifyTxError(preErr);
+      // eslint-disable-next-line no-console
+      console.warn("[approve pre-flight]", cls);
+      toast.error(cls.message);
+      return;
+    }
+
+    try {
+      const receipt = await tx.send({
+        address: addresses.MockUSDC as `0x${string}`,
+        abi: usdcAbi, functionName: "approve",
         args: [addresses.RebalanceVault as `0x${string}`, usdcIn],
       });
-      // Re-read allowance from chain (not cache). Spec rule.
-      await refetch();
+      // STRICT: success only if the on-chain receipt says so.
+      if (receipt.status !== "success") {
+        toast.error("Approve reverted on-chain.");
+        return;
+      }
+      // AWAIT a fresh on-chain allowance read before the next render flips the
+      // button to "Deposit". One tx per click; never auto-fire deposit.
+      await allowanceQuery.refetch();
       toast.success("USDC approved. You can deposit now.");
     } catch (e) {
-      if (e instanceof Error && /User rejected/i.test(e.message)) {
-        toast.message("Approve cancelled");
-      } else {
-        toast.error(`Approve failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
+      const cls = classifyTxError(e);
+      toast.error(cls.message);
     }
   };
 
   const deposit = async () => {
-    if (!address) { toast.error("Connect wallet first"); return; }
-    if (monIn === 0n && usdcIn === 0n) { toast.error("Enter MON or USDC"); return; }
-    if (!publicClient) return;
+    if (!address || !publicClient) { toast.error("Connect wallet first"); return; }
+    if (monIn === 0n && usdcIn === 0n) { toast.error("Enter MON"); return; }
+
+    // Pre-flight simulate. This is THE acceptance criterion for STEP 4: the
+    // agent wallet hits "vault: agent blocked" here, never reaches the wallet
+    // prompt, never sees "Deposit confirmed".
+    try {
+      await publicClient.simulateContract({
+        address: addresses.RebalanceVault as `0x${string}`,
+        abi: vaultAbi, functionName: "deposit",
+        args: [usdcIn], value: monIn,
+        account: address,
+      });
+    } catch (preErr) {
+      const cls = classifyTxError(preErr);
+      // eslint-disable-next-line no-console
+      console.warn("[deposit pre-flight]", cls);
+      toast.error(cls.message);
+      return;
+    }
 
     try {
       const receipt = await tx.send({
         address: addresses.RebalanceVault as `0x${string}`,
-        abi: vaultAbi,
-        functionName: "deposit",
-        args: [usdcIn],
-        value: monIn,
+        abi: vaultAbi, functionName: "deposit",
+        args: [usdcIn], value: monIn,
       });
+      if (receipt.status !== "success") {
+        toast.error("Deposit reverted on-chain.");
+        return;
+      }
 
-      // Set cost basis on the first deposit (if none yet). Capture price at the
-      // block the tx mined in.
       const sharesAfter = (await publicClient.readContract({
         address: addresses.RebalanceVault as `0x${string}`,
-        abi: vaultAbi,
-        functionName: "balanceOf",
+        abi: vaultAbi, functionName: "balanceOf",
         args: [address],
       })) as bigint;
 
@@ -107,24 +191,35 @@ export function Deposit() {
       }
 
       setMonStr(""); setUsdcStr("");
-      await refetch();
+      await Promise.all([refetch(), allowanceQuery.refetch()]);
       toast.success("Deposit confirmed.");
     } catch (e) {
-      if (isInsufficientAllowance(e)) {
-        toast.error("USDC not approved for the vault. Approve first, then deposit.");
-        return;
-      }
-      if (e instanceof Error && /User rejected/i.test(e.message)) {
-        toast.message("Deposit cancelled");
-      } else {
-        toast.error(`Deposit failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
+      const cls = classifyTxError(e);
+      toast.error(cls.message);
     }
   };
 
-  const buttonLabel = needsApproval ? "Approve USDC" : "Deposit";
-  const onClick     = needsApproval ? approve : deposit;
-  const disabled    = tx.loading || (monIn === 0n && usdcIn === 0n);
+  // ---- button decision ----
+  // mon-only: always "Deposit MON". Never approve.
+  // advanced: strict state machine, "wait" is a hard disabled state.
+  const isMon = mode === "mon-only";
+  const buttonLabel = isMon
+    ? "Deposit MON"
+    : advancedButton === "wait"    ? "Checking allowance…"
+    : advancedButton === "approve" ? "Approve USDC"
+    :                                "Deposit";
+
+  const onClick = isMon
+    ? deposit
+    : advancedButton === "approve" ? approve
+    : advancedButton === "deposit" ? deposit
+    : undefined;
+
+  const disabled =
+    tx.loading ||
+    (isMon
+      ? monIn === 0n
+      : advancedButton === "wait" || (monIn === 0n && usdcIn === 0n));
 
   return (
     <div className="mx-auto max-w-xl">
@@ -132,36 +227,93 @@ export function Deposit() {
         <CardHeader className="text-center">
           <CardTitle className="text-2xl">Chog Vault</CardTitle>
           <CardDescription className="mt-2 text-base">
-            Deposit MON + USDC. The agent keeps you at 60/40 and earns from volatility — withdraw anytime.
+            {isMon
+              ? "Deposit MON. The agent automatically splits it to 60/40 and rebalances — no USDC needed."
+              : "Deposit MON + USDC. The agent keeps you at 60/40 and earns from volatility — withdraw anytime."}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
-          <Field
-            label="MON"
-            value={monStr}
-            onChange={setMonStr}
-            balance={snap?.userMonBalance ? `${formatMON(snap.userMonBalance, 4)} MON` : "—"}
-            onMax={handleMax}
-          />
-          <Field
-            label="USDC"
-            value={usdcStr}
-            onChange={setUsdcStr}
-            balance={snap?.userUsdcBalance ? `${formatUSDC(snap.userUsdcBalance, 2)} USDC` : "—"}
-            onMax={handleUsdcMax}
-          />
+          <ModeToggle mode={mode} onChange={setMode} />
+
+          {isMon ? (
+            <Field
+              label="MON"
+              value={monStr}
+              onChange={setMonStr}
+              balance={snap?.userMonBalance ? `${formatMON(snap.userMonBalance, 4)} MON` : "—"}
+              onMax={handleMonMax}
+            />
+          ) : (
+            <>
+              <Field
+                label="MON"
+                value={monStr}
+                onChange={setMonStr}
+                balance={snap?.userMonBalance ? `${formatMON(snap.userMonBalance, 4)} MON` : "—"}
+                onMax={handleMonMax}
+              />
+              <Field
+                label="USDC"
+                value={usdcStr}
+                onChange={setUsdcStr}
+                balance={snap?.userUsdcBalance ? `${formatUSDC(snap.userUsdcBalance, 2)} USDC` : "—"}
+                onMax={handleUsdcMax}
+              />
+            </>
+          )}
 
           <Button onClick={onClick} disabled={disabled} size="lg" className="w-full">
             {tx.loading ? "Confirming…" : buttonLabel}
           </Button>
 
-          {needsApproval && (
+          {!isMon && advancedButton === "approve" && (
             <p className="text-xs text-[var(--text-muted)] text-center">
               Two-step flow: approve USDC first, then click Deposit.
             </p>
           )}
+          {!isMon && advancedButton === "wait" && (
+            <p className="text-xs text-[var(--text-muted)] text-center">
+              Reading current allowance from chain so we don&apos;t over-prompt you.
+            </p>
+          )}
+          {isMon && (
+            <p className="text-xs text-[var(--text-muted)] text-center">
+              One click. The agent buys USDC for you on its next rebalance.
+            </p>
+          )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function ModeToggle({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => void }) {
+  return (
+    <div className="grid grid-cols-2 gap-1 p-1 rounded-2xl bg-[var(--purple-soft)] text-sm">
+      <button
+        type="button"
+        onClick={() => onChange("mon-only")}
+        className={cn(
+          "py-2 rounded-xl font-semibold transition-colors",
+          mode === "mon-only"
+            ? "bg-white text-[var(--purple-strong)] shadow-sm"
+            : "text-[var(--text-muted)] hover:text-[var(--purple-strong)]"
+        )}
+      >
+        MON only <span className="opacity-70">(auto-split)</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => onChange("advanced")}
+        className={cn(
+          "py-2 rounded-xl font-semibold transition-colors",
+          mode === "advanced"
+            ? "bg-white text-[var(--purple-strong)] shadow-sm"
+            : "text-[var(--text-muted)] hover:text-[var(--purple-strong)]"
+        )}
+      >
+        MON + USDC <span className="opacity-70">(advanced)</span>
+      </button>
     </div>
   );
 }

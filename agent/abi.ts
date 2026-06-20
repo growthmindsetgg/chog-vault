@@ -13,6 +13,7 @@ export const vaultAbi = [
   { type: "function", name: "logBook",     stateMutability: "view",       inputs: [], outputs: [{ type: "address" }] },
   { type: "function", name: "deposit",     stateMutability: "payable",    inputs: [{ type: "uint256", name: "usdcAmount" }], outputs: [] },
   { type: "function", name: "withdraw",    stateMutability: "nonpayable", inputs: [{ type: "uint256", name: "shares"    }], outputs: [] },
+  { type: "function", name: "setPaused",   stateMutability: "nonpayable", inputs: [{ type: "bool",    name: "_paused"   }], outputs: [] },
   {
     type: "event", name: "Rebalanced", anonymous: false,
     inputs: [
